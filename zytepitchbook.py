@@ -2,6 +2,7 @@
 
 import os
 import json
+import webbrowser
 import csv
 import time
 import random
@@ -1129,6 +1130,90 @@ def _build_auth_options_from_args(args) -> PitchbookAuthOptions:
     )
 
 
+def _render_ui_from_csv(csv_path: str, html_path: Optional[str] = None, title: str = "PitchBook Results") -> str:
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(csv_path)
+    rows: List[Dict[str, str]] = []
+    with open(csv_path, "r", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for r in reader:
+            rows.append({k: (v or "") for k, v in r.items()})
+    columns: List[str] = list(rows[0].keys()) if rows else []
+    data_json = json.dumps({"columns": columns, "rows": rows}, ensure_ascii=False)
+    # prevent closing the script tag if data contains </script>
+    data_json = data_json.replace("</", "<\/")
+    html = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>{title}</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; color: #222; }}
+    h1 {{ font-size: 20px; margin: 0 0 12px; }}
+    .controls {{ display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }}
+    input[type=text] {{ padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px; min-width: 240px; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    thead th {{ position: sticky; top: 0; background: #fafafa; border-bottom: 1px solid #ddd; text-align: left; padding: 8px; font-weight: 600; }}
+    tbody td {{ border-top: 1px solid #eee; padding: 8px; vertical-align: top; }}
+    tbody tr:hover {{ background: #fffdf5; }}
+    a {{ color: #0066cc; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    .count {{ color: #666; font-size: 12px; }}
+  </style>
+  <script>window.__PB_DATA__ = {data_json};</script>
+</head>
+<body>
+  <h1>{title}</h1>
+  <div class=\"controls\">
+    <input id=\"q\" type=\"text\" placeholder=\"Search...\" />
+    <span class=\"count\" id=\"count\"></span>
+  </div>
+  <div style=\"overflow:auto; max-width:100%;\">
+    <table id=\"tbl\"> <thead id=\"thead\"></thead> <tbody id=\"tbody\"></tbody> </table>
+  </div>
+  <script>
+    const S = window.__PB_DATA__ || {columns:[], rows:[]};
+    const thead = document.getElementById('thead');
+    const tbody = document.getElementById('tbody');
+    const q = document.getElementById('q');
+    const countEl = document.getElementById('count');
+    function escapeHtml(s){return (s+"").replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');}
+    function renderHead(){
+      const ths = S.columns.map(c=>`<th>${escapeHtml(c)}</th>`).join('');
+      thead.innerHTML = `<tr>${ths}</tr>`;
+    }
+    function isLink(val){return /^https?:\/\//i.test(val||'');}
+    function renderRows(filter){
+      const f = (filter||'').toLowerCase().trim();
+      let rows = S.rows;
+      if(f){ rows = rows.filter(r => S.columns.some(c => (r[c]||'').toLowerCase().includes(f))); }
+      const html = rows.map(r=>{
+        const tds = S.columns.map(c=>{
+          const v = r[c]||'';
+          if(isLink(v)) return `<td><a href="${escapeHtml(v)}" target="_blank" rel="noopener">${escapeHtml(v)}</a></td>`;
+          return `<td>${escapeHtml(v)}</td>`;
+        }).join('');
+        return `<tr>${tds}</tr>`;
+      }).join('');
+      tbody.innerHTML = html || '<tr><td colspan="'+S.columns.length+'" style="color:#999">No rows</td></tr>';
+      countEl.textContent = rows.length + ' rows';
+    }
+    renderHead();
+    renderRows('');
+    q.addEventListener('input', ()=>renderRows(q.value));
+  </script>
+</body>
+</html>
+"""
+    out = html_path or os.path.splitext(csv_path)[0] + ".html"
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    return out
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -1140,6 +1225,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("query", help="Search query to run on PitchBook or glob for offline HTML when --mode=offline")
     parser.add_argument("--output", "-o", help="Output CSV path")
+    parser.add_argument("--open-ui", action="store_true", help="Open results in a local HTML UI after completion")
     parser.add_argument(
         "--max-pages",
         type=int,
@@ -1238,3 +1324,9 @@ if __name__ == "__main__":
         scraper.crawl_offline_files(html_files)
     else:
         scraper.crawl(query=args.query)
+    if args.open_ui:
+        html_out = _render_ui_from_csv(output_path, title=f"{cfg.name} – {args.query}")
+        try:
+            webbrowser.open_new_tab(f"file://{os.path.abspath(html_out)}")
+        except Exception:
+            pass
