@@ -10,6 +10,7 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urljoin, urlencode, urlparse
+import glob
 
 import requests
 from urllib.parse import urlsplit
@@ -27,8 +28,6 @@ def _strip_or_none(value: Optional[str]) -> Optional[str]:
 
 
 ZYTE_API_KEY = os.getenv("ZYTE_API_KEY")
-if not ZYTE_API_KEY:
-    raise RuntimeError("ZYTE_API_KEY env var is not set. In PowerShell: $env:ZYTE_API_KEY='YOUR_KEY'")
 
 ZYTE_ENDPOINT = "https://api.zyte.com/v1/extract"
 PITCHBOOK_LOGIN_URL_DEFAULT = "https://pitchbook.com/account/login"
@@ -446,7 +445,7 @@ class ListScraper:
         if low < 0 or high < 0 or low > high:
             raise ValueError("page_sleep_range must be non-negative and increasing")
         self.page_sleep_range = (low, high)
-        self.client = client or ZyteSessionClient(ZYTE_API_KEY)
+        self.client = client
         self.throttle = AdaptiveThrottle(self.page_sleep_range)
         self.max_empty_pages = 1
 
@@ -593,6 +592,29 @@ class ListScraper:
             print(f"[{self.cfg.name}] Next request in {wait_for:.2f}s")
             time.sleep(wait_for)
         print(f"[{self.cfg.name}] Done. Pages: {pages}, Rows: {total}, File: {self.out_csv}")
+
+    def crawl_offline_files(self, html_files: List[str]) -> None:
+        if not html_files:
+            raise RuntimeError("No HTML files were provided for offline ingestion.")
+        total = 0
+        pages = 0
+        for path in html_files:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    html = fh.read()
+            except Exception as exc:
+                print(f"[{self.cfg.name}] Skipping '{path}': {exc}")
+                continue
+            soup = BeautifulSoup(html, "html.parser")
+            rows = self.parse_rows(soup, page_url=f"file://{os.path.abspath(path)}")
+            if not rows:
+                print(f"[{self.cfg.name}] {os.path.basename(path)}: no rows parsed.")
+                continue
+            self.append_csv(rows)
+            total += len(rows)
+            pages += 1
+            print(f"[{self.cfg.name}] Parsed file {os.path.basename(path)}: saved {len(rows)} rows (total={total}) -> {self.out_csv}")
+        print(f"[{self.cfg.name}] Offline ingestion complete. Files: {pages}, Rows: {total}, File: {self.out_csv}")
 
 
 def _pitchbook_search_url(entity: str, query: str, base: str) -> str:
@@ -854,13 +876,13 @@ def _build_auth_options_from_args(args) -> PitchbookAuthOptions:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Scrape PitchBook search results with Zyte (reduced automation cues)")
+    parser = argparse.ArgumentParser(description="PitchBook list exporter with offline modes and optional Zyte rendering")
     parser.add_argument(
         "entity",
         choices=["companies", "people", "investors"],
         help="Which PitchBook directory to crawl",
     )
-    parser.add_argument("query", help="Search query to run on PitchBook")
+    parser.add_argument("query", help="Search query to run on PitchBook or glob for offline HTML when --mode=offline")
     parser.add_argument("--output", "-o", help="Output CSV path")
     parser.add_argument(
         "--max-pages",
@@ -885,8 +907,9 @@ if __name__ == "__main__":
         help="Override the browser user-agent; defaults to a rotating profile",
     )
     parser.add_argument("--login-url", help="Override the login form URL")
-    # Rendering mode
+    # Rendering mode and run mode
     parser.add_argument("--render", choices=["auto", "browser", "http"], default="auto", help="Rendering mode: auto (default), browser, or http")
+    parser.add_argument("--mode", choices=["network", "offline"], default="offline", help="Run mode: offline (default) reads local HTML files; network uses Zyte API")
     parser.add_argument(
         "--skip-login",
         action="store_true",
@@ -913,7 +936,11 @@ if __name__ == "__main__":
         sleep_range = (args.min_delay, args.max_delay)
 
     auth_options = _build_auth_options_from_args(args)
-    client = ZyteSessionClient(ZYTE_API_KEY, auth_options, render_mode=args.render)
+    client: Optional[ZyteSessionClient] = None
+    if args.mode == "network":
+        if not ZYTE_API_KEY:
+            raise SystemExit("ZYTE_API_KEY must be set for network mode.")
+        client = ZyteSessionClient(ZYTE_API_KEY, auth_options, render_mode=args.render)
 
     scraper = ListScraper(
         cfg=cfg,
@@ -922,5 +949,10 @@ if __name__ == "__main__":
         page_sleep_range=sleep_range,
         client=client,
     )
-    scraper.crawl(query=args.query)
+    if args.mode == "offline":
+        # Treat query as a glob of HTML files to parse
+        html_files = sorted(glob.glob(args.query))
+        scraper.crawl_offline_files(html_files)
+    else:
+        scraper.crawl(query=args.query)
 
