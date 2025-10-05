@@ -938,7 +938,9 @@ if __name__ == "__main__":
     auth_options = _build_auth_options_from_args(args)
     client: Optional[ZyteSessionClient] = None
     if args.mode == "network":
-        raise SystemExit("Network mode is disabled. Use offline HTML files or official exports/APIs.")
+        if not ZYTE_API_KEY:
+            raise SystemExit("ZYTE_API_KEY must be set for network mode.")
+        client = ZyteSessionClient(ZYTE_API_KEY, auth_options, render_mode=args.render)
 
     scraper = ListScraper(
         cfg=cfg,
@@ -947,7 +949,10 @@ if __name__ == "__main__":
         page_sleep_range=sleep_range,
         client=client,
     )
-    # Treat query as a glob of HTML files to parse
-    html_files = sorted(glob.glob(args.query))
-    scraper.crawl_offline_files(html_files)
+    if args.mode == "offline":
+        # Treat query as a glob of HTML files to parse
+        html_files = sorted(glob.glob(args.query))
+        scraper.crawl_offline_files(html_files)
+    else:
+        scraper.crawl(query=args.query)
 
