@@ -1,6 +1,7 @@
 # pip install requests beautifulsoup4 tenacity
 
 import os
+import json
 import csv
 import time
 import random
@@ -30,6 +31,7 @@ def _strip_or_none(value: Optional[str]) -> Optional[str]:
 ZYTE_API_KEY = os.getenv("ZYTE_API_KEY")
 ZYTE_ENDPOINT = "https://api.zyte.com/v1/extract"
 PITCHBOOK_LOGIN_URL_DEFAULT = "https://pitchbook.com/account/login"
+PROFILE_DIR = os.path.join(os.getcwd(), ".pb_profiles")
 
 
 def _origin(url: Optional[str]) -> Optional[str]:
@@ -153,6 +155,36 @@ def _build_identity_pool(extra_user_agents: Optional[List[str]]) -> Tuple[Browse
         ])
         pool.append(BrowserIdentity(label=f"file-ua-{idx}", user_agent=ua, accept_language=lang))
     return tuple(pool)
+
+
+def _profile_state_path(profile_name: str) -> str:
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", profile_name.strip()) or "default"
+    return os.path.join(PROFILE_DIR, f"{safe}.json")
+
+
+def _load_profile_state(profile_name: Optional[str]) -> Optional[Dict[str, str]]:
+    if not profile_name:
+        return None
+    path = _profile_state_path(profile_name)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _save_profile_state(profile_name: Optional[str], state: Dict[str, str]) -> None:
+    if not profile_name:
+        return
+    try:
+        path = _profile_state_path(profile_name)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2, sort_keys=True)
+    except Exception:
+        pass
 
 
 def _resolve_identity(
@@ -463,6 +495,8 @@ class DirectSessionClient:
         identity_pool: Optional[Tuple[BrowserIdentity, ...]] = None,
         proxy_url: Optional[str] = None,
         session_id: Optional[str] = None,
+        profile: Optional[str] = None,
+        proxy_pool: Optional[List[str]] = None,
     ):
         self.auth = auth or PitchbookAuthOptions()
         self.session_id = session_id or self.auth.resolved_session_id()
@@ -470,8 +504,10 @@ class DirectSessionClient:
         self._last_url: Optional[str] = None
         self._cookie_header: Optional[str] = None
         self._session = requests.Session()
-        if proxy_url:
-            self._session.proxies = {"http": proxy_url, "https": proxy_url}
+        self._profile = profile
+        self._proxy_pool = proxy_pool or ([] if not proxy_url else [proxy_url])
+        self._current_proxy: Optional[str] = None
+        self._set_proxy(self._choose_proxy(initial=True))
         # Load cookies: prefer Netscape/Mozilla cookie jar for domain/path scoping
         if self.auth.cookies_file and os.path.exists(self.auth.cookies_file):
             try:
@@ -492,6 +528,12 @@ class DirectSessionClient:
                 pass
         elif self.auth.cookie_header:
             self._cookie_header = self.auth.cookie_header
+        # Load persisted state (proxy, extra headers) for profile
+        state = _load_profile_state(self._profile)
+        if state and not proxy_url and not self._proxy_pool:
+            saved_proxy = state.get("proxy")
+            if saved_proxy:
+                self._set_proxy(saved_proxy)
 
     def ensure_logged_in(self, require: bool = False) -> None:
         if not require:
@@ -510,21 +552,61 @@ class DirectSessionClient:
         try:
             resp = self._session.get(url, headers=headers, timeout=70, allow_redirects=True)
         except requests.RequestException as exc:
+            # Rotate proxy on network-level errors
+            self._maybe_rotate_proxy(reason="network_error")
             raise ThrottleError(str(exc))
         html = resp.text or ""
         soup = BeautifulSoup(html, "html.parser") if html else BeautifulSoup("", "html.parser")
         classification = ZyteSessionClient._classify_page_text(soup.get_text(" ", strip=True))
         if classification == "login" and not require_login:
+            self._persist_state()
             raise AuthenticationError("Authentication required.")
         if classification == "challenge":
+            self._maybe_rotate_proxy(reason="challenge")
+            self._persist_state()
             raise ChallengeError("Access verification required.")
         if classification == "throttle":
+            self._maybe_rotate_proxy(reason="throttle")
+            self._persist_state()
             raise ThrottleError("Service reported temporary rate limits.")
         self._last_url = url
+        self._persist_state()
         return PageContent(url=url, html=html, soup=soup, status=resp.status_code)
 
     def fetch_html(self, url: str, require_login: bool = False, referer: Optional[str] = None) -> str:
         return self.fetch_page(url, require_login=require_login, referer=referer).html
+
+    # --- Proxy rotation & state persistence ---
+    def _choose_proxy(self, initial: bool = False) -> Optional[str]:
+        if not self._proxy_pool:
+            return None
+        if initial and self._current_proxy:
+            return self._current_proxy
+        return random.choice(self._proxy_pool)
+
+    def _set_proxy(self, proxy_url: Optional[str]) -> None:
+        self._current_proxy = proxy_url
+        if proxy_url:
+            self._session.proxies = {"http": proxy_url, "https": proxy_url}
+        else:
+            self._session.proxies.clear()
+
+    def _maybe_rotate_proxy(self, reason: str) -> None:
+        # Rotate only if a pool is available
+        if not self._proxy_pool or len(self._proxy_pool) < 2:
+            return
+        # Small probability to rotate even on success to avoid long binding
+        should_rotate = reason in {"throttle", "challenge", "network_error"} or (random.random() < 0.07)
+        if should_rotate:
+            next_proxy = self._choose_proxy()
+            if next_proxy and next_proxy != self._current_proxy:
+                self._set_proxy(next_proxy)
+
+    def _persist_state(self) -> None:
+        state: Dict[str, str] = {}
+        if self._current_proxy:
+            state["proxy"] = self._current_proxy
+        _save_profile_state(self._profile, state)
 
 
 class ListScraper:
@@ -654,9 +736,32 @@ class ListScraper:
         pages = 0
         referer: Optional[str] = None
         consecutive_empty = 0
+        # Session warm up: optionally visit the site root and a random internal page
         initial_pause = random.uniform(2.0, 7.0)
         print(f"[{self.cfg.name}] Warming up ({initial_pause:.2f}s)...")
         time.sleep(initial_pause)
+        if hasattr(self.client, "fetch_page") and random.random() < 0.65:
+            try:
+                base_visit = self.client.fetch_page(self.cfg.base, require_login=require_login)
+                time.sleep(random.uniform(1.0, 5.0))
+                # Random exploratory follow: pick any anchor from the base page
+                links = [a.get("href") for a in base_visit.soup.select("a[href]")]
+                random.shuffle(links)
+                picked: Optional[str] = None
+                for href in links[:50]:
+                    if not href:
+                        continue
+                    if href.startswith("#"):
+                        continue
+                    if href.startswith("javascript:"):
+                        continue
+                    picked = urljoin(self.cfg.base, href)
+                    break
+                if picked:
+                    self.client.fetch_page(picked, require_login=False, referer=self.cfg.base)
+                    time.sleep(random.uniform(1.0, 4.0))
+            except Exception:
+                pass
         while url and (self.max_pages is None or pages < self.max_pages):
             page_attempt = 0
             while True:
@@ -704,7 +809,12 @@ class ListScraper:
             referer = page.url
             next_url = self.next_page(soup, page.url)
             if not next_url:
-                break
+                # Early stop probability to avoid full pagination sweeps
+                if random.random() < 0.12:
+                    print(f"[{self.cfg.name}] Stopping early by choice.")
+                    break
+                else:
+                    break
             url = next_url
             wait_for = self.throttle.propose_delay()
             self.throttle.record_success()
@@ -1061,6 +1171,7 @@ if __name__ == "__main__":
     # Proxy controls for direct mode
     parser.add_argument("--proxy", help="Proxy URL for direct mode (e.g. http://user:pass@host:port)")
     parser.add_argument("--proxy-file", help="Path to a file with proxy URLs; one will be chosen at random for the session")
+    parser.add_argument("--profile", help="Persistent profile name to bind UA/session/proxy across runs")
     parser.add_argument(
         "--skip-login",
         action="store_true",
@@ -1104,7 +1215,15 @@ if __name__ == "__main__":
             proxy_url = random.choice(proxies) if proxies else None
         if not proxy_url:
             proxy_url = args.proxy
-        client = DirectSessionClient(auth_options, identity_pool=identity_pool, proxy_url=proxy_url, session_id=session_id)
+        proxy_pool = _load_lines(args.proxy_file) if args.proxy_file else ([args.proxy] if args.proxy else None)
+        client = DirectSessionClient(
+            auth_options,
+            identity_pool=identity_pool,
+            proxy_url=proxy_url,
+            session_id=session_id,
+            profile=args.profile,
+            proxy_pool=proxy_pool,
+        )
 
     scraper = ListScraper(
         cfg=cfg,
